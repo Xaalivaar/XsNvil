@@ -136,11 +136,35 @@ if ok_ls then
   ls.config.setup({
     history = true,
     updateevents = "TextChanged,TextChangedI",
-    enable_autosnippets = true,
+    enable_autosnippets = false,
   })
 
   local ok_latex_snip, latex_snip = pcall(require, "luasnip-latex-snippets")
   if ok_latex_snip then
+    -- The Gilles Castel collection registers many triggers as "autosnippets".
+    -- Convert those registrations into ordinary snippets so EVERY trigger
+    -- requires an explicit <Tab> press. Keep the original snippet definitions,
+    -- conditions, captures, priorities, and placeholder behavior unchanged.
+    -- The plugin registers snippets lazily in FileType callbacks, hence the
+    -- wrapper must surround setup_tex/setup_markdown, not just setup().
+    local function manualize_registration(register)
+      return function(...)
+        local original_add = ls.add_snippets
+        ls.add_snippets = function(filetype, snippets, opts)
+          if opts and opts.type == "autosnippets" then
+            opts = vim.tbl_extend("force", {}, opts, { type = "snippets" })
+          end
+          return original_add(filetype, snippets, opts)
+        end
+        local result = { pcall(register, ...) }
+        ls.add_snippets = original_add
+        if not result[1] then error(result[2]) end
+        return unpack(result, 2)
+      end
+    end
+
+    latex_snip.setup_tex = manualize_registration(latex_snip.setup_tex)
+    latex_snip.setup_markdown = manualize_registration(latex_snip.setup_markdown)
     latex_snip.setup({
       use_treesitter = false,     -- Uses VimTeX syntax detection instead of Tree-sitter
       allow_on_markdown = true,
