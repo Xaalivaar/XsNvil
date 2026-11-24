@@ -352,7 +352,7 @@ vim.api.nvim_create_autocmd("FileType", {
 
 
 -- ========================================================================== --
---              INKSCAPE DIAGRAMS: <Space>id / <Space>ie / <Space>ix           --
+--              INKSCAPE DIAGRAMS: <Space>id / <Space>ic / <Space>ie / <Space>ix           --
 -- ========================================================================== --
 -- Requirements: Inkscape 1.x, a graphical Linux session, and a TeX install.
 -- No separate watch_inkscape.sh or inotify-tools needed. While Neovim runs,
@@ -639,6 +639,59 @@ local function export_diagram_under_cursor()
   if svg then export_diagram(watch_diagram(svg, pdf), true) end
 end
 
+-- Copy an existing ./figures SVG under a new name, then open the copy.
+-- Like <Space>id, names may include subdirectories (e.g. mechanics/pendulum).
+-- This intentionally does not insert a LaTeX figure block.
+local function copy_diagram()
+  local root = vim.fn.getcwd()
+  if vim.fn.executable("inkscape") ~= 1 then
+    diagram_notify("Install Inkscape first", vim.log.levels.ERROR)
+    return
+  end
+
+  vim.ui.input({
+    prompt = "SVG to copy from ./figures/ (e.g. mechanics/pendulum): ",
+  }, function(source_input)
+    if source_input == nil then return end
+    local source_name = diagram_name(source_input)
+    if not source_name then return end
+    local source_svg = diagram_paths(root, source_name)
+    if vim.fn.filereadable(source_svg) ~= 1 then
+      diagram_notify("Source SVG not found: " .. source_svg, vim.log.levels.ERROR)
+      return
+    end
+
+    vim.ui.input({
+      prompt = "New SVG name in ./figures/ (e.g. mechanics/pendulum_copy): ",
+    }, function(dest_input)
+      if dest_input == nil then return end
+      local dest_name = diagram_name(dest_input)
+      if not dest_name then return end
+      local dest_svg, dest_pdf = diagram_paths(root, dest_name)
+      if uv.fs_stat(dest_svg) then
+        diagram_notify("Destination already exists: " .. dest_svg, vim.log.levels.ERROR)
+        return
+      end
+
+      local parent = vim.fn.fnamemodify(dest_svg, ":h")
+      vim.fn.mkdir(parent, "p")
+      if vim.fn.isdirectory(parent) ~= 1 then
+        diagram_notify("Cannot create directory " .. parent, vim.log.levels.ERROR)
+        return
+      end
+
+      -- Exclusive copy prevents silently overwriting existing work.
+      local ok, err = uv.fs_copyfile(source_svg, dest_svg, uv.constants.COPYFILE_EXCL)
+      if not ok then
+        diagram_notify("Could not copy SVG: " .. tostring(err), vim.log.levels.ERROR)
+        return
+      end
+      open_diagram(dest_svg, dest_pdf)
+      diagram_notify("Copied " .. source_name .. " to " .. dest_name .. ". Save in Inkscape to export.")
+    end)
+  end)
+end
+
 -- Buffer-local mappings keep non-LaTeX editing and all your existing keys intact.
 vim.api.nvim_create_autocmd("FileType", {
   group = augroup,
@@ -656,6 +709,8 @@ vim.api.nvim_create_autocmd("FileType", {
       buffer = ev.buf,
       desc = "Inkscape Preamble",
     })
+    vim.keymap.set("n", "<leader>ic", copy_diagram,
+      { buffer = ev.buf, desc = "Copy SVG diagram and open in Inkscape" })
     vim.keymap.set("n", "<leader>id", insert_diagram,
       { buffer = ev.buf, desc = "Create/insert Inkscape diagram" })
     vim.keymap.set("n", "<leader>ie", edit_diagram,
