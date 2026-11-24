@@ -113,6 +113,7 @@ if ok_wk then
     -- Core Doom-style leader groups
     { "<leader>b", group = "Buffer" },
     { "<leader>f", group = "File" },
+    { "<leader>i", group = "Inkscape diagrams" },
     { "<leader>o", group = "Open / Toggle" },
     { "<leader>q", group = "Quit / Session" },
     { "<leader>w", group = "Window" },
@@ -142,7 +143,7 @@ if ok_ls then
   if ok_latex_snip then
     latex_snip.setup({
       use_treesitter = false,     -- Uses VimTeX syntax detection instead of Tree-sitter
-      allow_on_markdown = false,
+      allow_on_markdown = true,
     })
   end
 
@@ -164,12 +165,14 @@ if ok_ls then
     end
   end, { silent = true, desc = "LuaSnip jump backward" })
 
-  -- Cycle choice nodes if a snippet offers alternatives
+  -- Cycle choice nodes, but preserve Neovim's regular <C-e> outside choices
   vim.keymap.set({ "i", "s" }, "<C-e>", function()
     if ls.choice_active() then
       ls.change_choice(1)
+    else
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-e>", true, false, true), "n", false)
     end
-  end, { silent = true, desc = "LuaSnip next choice node" })
+  end, { silent = true, desc = "LuaSnip next choice / regular Ctrl-E" })
 end
 
 -- ========================================================================== --
@@ -320,5 +323,320 @@ vim.api.nvim_create_autocmd("FileType", {
         { "tsf", desc = "Toggle fraction style", buffer = ev.buf },
       })
     end
+  end,
+})
+
+
+-- ========================================================================== --
+--              INKSCAPE DIAGRAMS: <Space>id / <Space>ie / <Space>ix           --
+-- ========================================================================== --
+-- Requirements: Inkscape 1.x, a graphical Linux session, and a TeX install.
+-- No separate watch_inkscape.sh or inotify-tools needed. While Neovim runs,
+-- libuv watches SVG files created/opened with these mappings and exports on save.
+--
+-- Run Neovim in your LaTeX PROJECT ROOT (check :pwd). A name such as
+-- "mechanics/pendulum" becomes ./figures/mechanics/pendulum.svg.
+-- Add \usepackage{graphicx}, \usepackage{color}, and \usepackage{transparent}
+-- to the LaTeX preamble once. Compile with VimTeX (Space ll).
+
+-- Close watchers from a previous :source $MYVIMRC before making replacements.
+local previous_diagram_watches = rawget(_G, "__user_inkscape_watches")
+if previous_diagram_watches then
+  for _, watch in pairs(previous_diagram_watches) do
+    watch.closed = true
+    if watch.timer then
+      pcall(function() watch.timer:stop(); watch.timer:close() end)
+    end
+    if watch.handle then
+      pcall(function() watch.handle:stop(); watch.handle:close() end)
+    end
+  end
+end
+local diagram_watches = {}
+_G.__user_inkscape_watches = diagram_watches
+
+local function diagram_notify(msg, level)
+  vim.notify("Inkscape: " .. msg, level or vim.log.levels.INFO)
+end
+
+-- A conservative path policy avoids traversal and LaTeX-unfriendly filenames.
+-- Relative slashes are accepted for subdirectories, e.g. maths/commutative.
+local function diagram_name(input)
+  if not input then return nil end
+  local name = vim.trim(input):gsub("%.svg$", "")
+  if name == "" or name:sub(1, 1) == "/" or name:sub(-1) == "/"
+    or name:find("//", 1, true) or not name:match("^[%w_/%-]+$") then
+    diagram_notify("Use a relative name such as geometry/circle (letters, numbers, _ and - only)",
+      vim.log.levels.ERROR)
+    return nil
+  end
+  return name
+end
+
+local function diagram_paths(root, name)
+  local base = root .. "/figures/" .. name
+  return base .. ".svg", base .. ".pdf", "figures/" .. name .. ".pdf_tex"
+end
+
+local function diagram_signature(path)
+  local stat = uv.fs_stat(path)
+  if not stat or stat.type ~= "file" then return nil end
+  local mt = stat.mtime or {}
+  return table.concat({ tostring(mt.sec or 0), tostring(mt.nsec or 0), tostring(stat.size) }, ":")
+end
+
+-- Asynchronous export: no GUI freezes while Inkscape renders PDF+LaTeX.
+local function export_diagram(watch, force)
+  if watch.closed then return end
+  local signature = diagram_signature(watch.svg)
+  if not signature then return end
+  if watch.running then
+    watch.pending = true
+    return
+  end
+  if not force and watch.last_exported == signature then return end
+  if vim.fn.executable("inkscape") ~= 1 then
+    diagram_notify("inkscape executable not found", vim.log.levels.ERROR)
+    return
+  end
+
+  watch.running = true
+  watch.last_exported = signature
+  local job = vim.fn.jobstart({
+    "inkscape", watch.svg,
+    "--export-area-drawing",
+    "--export-type=pdf",
+    "--export-latex",
+    "--export-filename=" .. watch.pdf,
+  }, {
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if watch.closed then return end
+        watch.running = false
+        local changed_during_export = diagram_signature(watch.svg) ~= signature
+        if code ~= 0 then
+          -- A blank SVG has no drawing area to export; draw something first.
+          watch.last_exported = nil
+          diagram_notify("Export failed: " .. vim.fn.fnamemodify(watch.svg, ":t") ..
+            " (check the drawing and :messages)", vim.log.levels.WARN)
+        end
+        watch.pending = false
+        if changed_during_export then
+          -- Inkscape can be saved again while an older export is running.
+          export_diagram(watch, false)
+        end
+      end)
+    end,
+  })
+  if job <= 0 then
+    watch.running = false
+    watch.last_exported = nil
+    diagram_notify("Could not start the Inkscape export command", vim.log.levels.ERROR)
+  end
+end
+
+local function watch_diagram(svg, pdf)
+  local existing = diagram_watches[svg]
+  if existing and not existing.closed then return existing end
+
+  local directory = vim.fn.fnamemodify(svg, ":h")
+  local filename = vim.fn.fnamemodify(svg, ":t")
+  local watch = {
+    svg = svg,
+    pdf = pdf,
+    running = false,
+    pending = false,
+    last_exported = diagram_signature(svg),
+    closed = false,
+  }
+
+  local handle = uv.new_fs_event()
+  local timer = uv.new_timer()
+  if not handle or not timer then
+    if handle then handle:close() end
+    if timer then timer:close() end
+    diagram_notify("Filesystem watcher unavailable; use Space ix to export", vim.log.levels.WARN)
+    -- Keep this state for manual export, even if watching is unavailable.
+    diagram_watches[svg] = watch
+    return watch
+  end
+
+  watch.handle = handle
+  watch.timer = timer
+  local ok, err = handle:start(directory, {}, function(event_err, changed_file)
+    if watch.closed or event_err then return end
+    -- Directory watching catches both ordinary saves and atomic renames.
+    if changed_file and changed_file ~= filename then return end
+    timer:stop()
+    timer:start(450, 0, vim.schedule_wrap(function()
+      if not watch.closed then export_diagram(watch, false) end
+    end))
+  end)
+  if not ok then
+    handle:close()
+    timer:close()
+    watch.handle = nil
+    watch.timer = nil
+    diagram_notify("Could not watch " .. directory .. ": " .. tostring(err) ..
+      "; use Space ix to export", vim.log.levels.WARN)
+  end
+
+  diagram_watches[svg] = watch
+  return watch
+end
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  group = augroup,
+  callback = function()
+    for _, watch in pairs(diagram_watches) do
+      watch.closed = true
+      if watch.timer then
+        pcall(function() watch.timer:stop(); watch.timer:close() end)
+      end
+      if watch.handle then
+        pcall(function() watch.handle:stop(); watch.handle:close() end)
+      end
+    end
+  end,
+})
+
+local function open_diagram(svg, pdf)
+  if vim.fn.executable("inkscape") ~= 1 then
+    diagram_notify("Install Inkscape and ensure it is in PATH", vim.log.levels.ERROR)
+    return
+  end
+  watch_diagram(svg, pdf)
+  local job = vim.fn.jobstart({ "inkscape", svg }, { detach = true })
+  if job <= 0 then
+    diagram_notify("Could not open " .. svg, vim.log.levels.ERROR)
+  end
+end
+
+local svg_blank_template = {
+  '<?xml version="1.0" encoding="UTF-8"?>',
+  '<svg xmlns="http://www.w3.org/2000/svg"',
+  '     width="160mm" height="100mm" viewBox="0 0 160 100">',
+  '</svg>',
+}
+
+local function insert_diagram()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local root = vim.fn.getcwd()
+
+  if not vim.bo[bufnr].modifiable then
+    diagram_notify("This buffer is not modifiable", vim.log.levels.WARN)
+    return
+  end
+  if vim.fn.executable("inkscape") ~= 1 then
+    diagram_notify("Install Inkscape first", vim.log.levels.ERROR)
+    return
+  end
+
+  vim.ui.input({
+    prompt = "Diagram name in ./figures/ (e.g. mechanics/pendulum): ",
+  }, function(input)
+    local name = diagram_name(input)
+    if not name then return end
+    if not vim.api.nvim_buf_is_valid(bufnr) then return end
+
+    local svg, pdf, latex_input = diagram_paths(root, name)
+    local parent = vim.fn.fnamemodify(svg, ":h")
+    vim.fn.mkdir(parent, "p")
+    if vim.fn.isdirectory(parent) ~= 1 then
+      diagram_notify("Cannot create directory " .. parent, vim.log.levels.ERROR)
+      return
+    end
+
+    if vim.fn.filereadable(svg) ~= 1 then
+      if vim.fn.writefile(svg_blank_template, svg) ~= 0 then
+        diagram_notify("Could not create " .. svg, vim.log.levels.ERROR)
+        return
+      end
+    end
+
+    local name_short = name:match("[^/]+$") or name
+    local latex_dir = "figures/" .. (name:match("^(.*)/") or "")
+    if latex_dir ~= "figures/" then latex_dir = latex_dir .. "/" end
+    local caption = name_short:gsub("[_%-]", " ")
+    caption = caption:gsub("^%l", string.upper)
+
+    local block = {
+      "\\begin{figure}[htbp]",
+      "  \\centering",
+      "  \\begingroup",
+      "    \\graphicspath{{" .. latex_dir .. "}}",
+      "    \\def\\svgwidth{0.8\\linewidth}",
+      "    \\input{" .. latex_input .. "}",
+      "  \\endgroup",
+      "  \\caption{" .. caption .. "}",
+      "  \\label{fig:" .. name:gsub("/", "-") .. "}",
+      "\\end{figure}",
+    }
+
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+    local after_line = math.min(cursor_line, line_count)
+    local ok, insert_err = pcall(vim.api.nvim_buf_set_lines,
+      bufnr, after_line, after_line, false, block)
+    if not ok then
+      diagram_notify("Cannot insert LaTeX: " .. tostring(insert_err), vim.log.levels.ERROR)
+      return
+    end
+
+    open_diagram(svg, pdf)
+    diagram_notify("Created reference for " .. name .. ". Draw and save with Ctrl+S.")
+  end)
+end
+
+-- Reopen a figure by placing the cursor on its \input{figures/...pdf_tex} line.
+local function diagram_under_cursor()
+  local line = vim.api.nvim_get_current_line()
+  local name = line:match("\\input%s*{%s*figures/([%w_/%-]+)%.pdf_tex%s*}")
+  if not name then
+    diagram_notify("Place the cursor on the \\input{figures/...pdf_tex} line", vim.log.levels.WARN)
+    return nil
+  end
+  local root = vim.fn.getcwd()
+  local svg, pdf = diagram_paths(root, name)
+  if vim.fn.filereadable(svg) ~= 1 then
+    diagram_notify("SVG not found: " .. svg, vim.log.levels.ERROR)
+    return nil
+  end
+  return svg, pdf
+end
+
+local function edit_diagram()
+  local svg, pdf = diagram_under_cursor()
+  if svg then open_diagram(svg, pdf) end
+end
+
+local function export_diagram_under_cursor()
+  local svg, pdf = diagram_under_cursor()
+  if svg then export_diagram(watch_diagram(svg, pdf), true) end
+end
+
+-- Buffer-local mappings keep non-LaTeX editing and all your existing keys intact.
+vim.api.nvim_create_autocmd("FileType", {
+  group = augroup,
+  pattern = { "tex", "plaintex" },
+  callback = function(ev)
+    -- Insert LaTeX packages required for Inkscape figures
+    vim.keymap.set("n", "<leader>ib", function()
+      local row = vim.api.nvim_win_get_cursor(0)[1]
+      vim.api.nvim_buf_set_lines(0, row, row, false, {
+        "\\usepackage{graphicx}",
+        "\\usepackage{color}",
+        "\\usepackage{transparent}",
+      })
+    end, {
+      buffer = ev.buf,
+      desc = "Inkscape Preamble",
+    })
+    vim.keymap.set("n", "<leader>id", insert_diagram,
+      { buffer = ev.buf, desc = "Create/insert Inkscape diagram" })
+    vim.keymap.set("n", "<leader>ie", edit_diagram,
+      { buffer = ev.buf, desc = "Edit diagram on input line" })
+    vim.keymap.set("n", "<leader>ix", export_diagram_under_cursor,
+      { buffer = ev.buf, desc = "Export diagram on input line" })
   end,
 })
